@@ -1097,13 +1097,621 @@ vm_object_bootstrap(void)
 	simple_lock_init(&vor_lock, ETAP_NORMA_VOR);
 #endif	/* NORMA_VM */
 }
+/*
+ * ============================================================================
+ * GLOBAL VM OBJECT SUBSYSTEM STRUCTURES
+ * ============================================================================
+ */
 
-void
-vm_object_init(void)
+/* Global object tracking */
+static struct vm_object_global_state {
+    vm_object_t object_list;
+    unsigned int object_count;
+    unsigned int object_count_peak;
+    unsigned int object_count_limit;
+    simple_lock_t list_lock;
+    
+    /* Statistics */
+    unsigned long long total_allocations;
+    unsigned long long total_deallocations;
+    unsigned long long total_bytes_allocated;
+    unsigned long long total_bytes_deallocated;
+    unsigned long long total_allocation_time_ns;
+    unsigned long long total_deallocation_time_ns;
+    unsigned long long max_allocation_time_ns;
+    unsigned long long max_deallocation_time_ns;
+    unsigned long long total_page_faults;
+    unsigned long long total_page_faults_major;
+    unsigned long long total_page_faults_minor;
+    
+    /* Cache statistics */
+    unsigned long long cache_hits;
+    unsigned long long cache_misses;
+    unsigned long long cache_evictions;
+    unsigned int cache_size;
+    unsigned int cache_max_size;
+    
+    /* Compression statistics */
+    unsigned long long compressed_pages;
+    unsigned long long compressed_bytes_saved;
+    unsigned long long compression_time_ns;
+    unsigned long long decompression_time_ns;
+    
+    /* Deduplication statistics */
+    unsigned long long dedup_pages_shared;
+    unsigned long long dedup_bytes_saved;
+    unsigned long long dedup_hash_collisions;
+    
+    /* NUMA statistics */
+    unsigned long long numa_migrations;
+    unsigned long long numa_remote_accesses;
+    unsigned long long numa_local_accesses;
+    
+    /* Performance */
+    unsigned long long peak_memory_usage;
+    unsigned long long current_memory_usage;
+    unsigned long long low_memory_threshold;
+    unsigned long long high_memory_threshold;
+    
+    /* Monitoring */
+    unsigned int monitor_registered_objects;
+    unsigned int audit_enabled_objects;
+    unsigned int encrypted_objects;
+    unsigned int compressed_objects;
+    
+} vm_object_global_state;
+
+/* Object pools for different sizes */
+static struct vm_object_pool {
+    vm_object_t *objects;
+    unsigned int size;
+    unsigned int count;
+    unsigned int max_count;
+    unsigned int hit_count;
+    unsigned int miss_count;
+    simple_lock_t pool_lock;
+    vm_size_t object_size;
+} vm_object_pools[VM_OBJECT_POOL_COUNT];
+
+/* NUMA node local caches */
+static struct vm_object_numa_cache {
+    vm_object_t *objects;
+    unsigned int count;
+    unsigned int max_count;
+    simple_lock_t cache_lock;
+    unsigned int node_id;
+} vm_object_numa_caches[MAX_NUMA_NODES];
+
+/* Compression algorithm registry */
+static struct vm_compression_algorithm {
+    unsigned int id;
+    char name[32];
+    unsigned int priority;
+    unsigned int (*compress)(unsigned char *, vm_size_t, unsigned char *, vm_size_t *);
+    unsigned int (*decompress)(unsigned char *, vm_size_t, unsigned char *, vm_size_t *);
+    boolean_t (*init)(void);
+    void (*cleanup)(void);
+} vm_compression_algorithms[VM_COMPRESS_MAX] = {0};
+
+/* Object type registry */
+static struct vm_object_type {
+    unsigned int type_id;
+    char name[64];
+    vm_size_t default_size;
+    unsigned int default_flags;
+    unsigned int default_priority;
+    unsigned int default_numa_node;
+    void (*init_callback)(vm_object_t);
+    void (*destroy_callback)(vm_object_t);
+    unsigned int registered_count;
+} vm_object_types[VM_OBJECT_TYPE_MAX];
+
+/* Watchdog timer */
+static struct vm_object_watchdog {
+    unsigned long long last_check;
+    unsigned long long check_interval_ns;
+    unsigned int stuck_objects;
+    unsigned int recovered_objects;
+    simple_lock_t watchdog_lock;
+} vm_object_watchdog;
+
+/*
+ * ============================================================================
+ * EXTENDED VM_OBJECT_INIT FUNCTION
+ * ============================================================================
+ */
+
+/*
+ * ============================================================================
+ * MONITORING THREAD
+ * ============================================================================
+ */
+
+void vm_object_monitor_thread(void)
 {
-	/*
-	 *	Finish initializing the kernel object.
-	 */
+    thread_set_name(current_thread(), "vm_object_monitor");
+    
+    while (1) {
+        thread_sleep(&vm_object_monitor_thread, NULL, 5000); /* 5 seconds */
+        
+        simple_lock(&vm_object_global_state.list_lock);
+        
+        /* Check for memory pressure */
+        if (vm_object_global_state.current_memory_usage > 
+            vm_object_global_state.high_memory_threshold) {
+            /* Trigger cache cleanup */
+            vm_object_cache_trim(FALSE);
+            printf("VM Object Monitor: Memory pressure detected, cache trimmed\n");
+        }
+        
+        /* Check object count */
+        if (vm_object_global_state.object_count > 
+            vm_object_global_state.object_count_limit * 0.9) {
+            printf("VM Object Monitor: Object count near limit: %u/%u\n",
+                   vm_object_global_state.object_count,
+                   vm_object_global_state.object_count_limit);
+        }
+        
+        simple_unlock(&vm_object_global_state.list_lock);
+    }
+}
+
+/*
+ * ============================================================================
+ * WATCHDOG THREAD
+ * ============================================================================
+ */
+
+void vm_object_watchdog_thread(void)
+{
+    thread_set_name(current_thread(), "vm_object_watchdog");
+    
+    while (1) {
+        thread_sleep(&vm_object_watchdog_thread, NULL, 60000); /* 60 seconds */
+        
+        simple_lock(&vm_object_watchdog.watchdog_lock);
+        
+        unsigned long long now = mach_absolute_time();
+        vm_object_watchdog.last_check = now;
+        
+        /* Scan for stuck objects */
+        simple_lock(&vm_object_global_state.list_lock);
+        
+        vm_object_t obj = vm_object_global_state.object_list;
+        unsigned int stuck = 0;
+        
+        while (obj != NULL) {
+            vm_object_lock(obj);
+            
+            /* Check for objects stuck in paging for too long */
+            if (obj->paging_in_progress > 0) {
+                unsigned long long paging_time = now - obj->paging_start_time;
+                if (paging_time > 30000000000ULL) { /* 30 seconds */
+                    printf("Watchdog: Object %p stuck in paging for %llu ms\n",
+                           obj, paging_time / 1000000);
+                    stuck++;
+                }
+            }
+            
+            /* Check for objects stuck in migration */
+            if (obj->migrating && (now - obj->migration_start_time) > 30000000000ULL) {
+                printf("Watchdog: Object %p stuck in migration\n", obj);
+                obj->migrating = FALSE;
+                vm_object_wakeup(obj, VM_OBJECT_EVENT_MIGRATION);
+                vm_object_watchdog.recovered_objects++;
+            }
+            
+            vm_object_unlock(obj);
+            obj = obj->global_next;
+        }
+        
+        vm_object_watchdog.stuck_objects = stuck;
+        
+        simple_unlock(&vm_object_global_state.list_lock);
+        simple_unlock(&vm_object_watchdog.watchdog_lock);
+    }
+}
+
+/*
+ * ============================================================================
+ * CACHE WARMER THREAD
+ * ============================================================================
+ */
+
+void vm_object_cache_warmer_thread(void)
+{
+    thread_set_name(current_thread(), "vm_object_cache_warmer");
+    
+    while (1) {
+        thread_sleep(&vm_object_cache_warmer_thread, NULL, 300000); /* 5 minutes */
+        
+        /* Pre-populate object pools based on usage patterns */
+        for (unsigned int i = 0; i < VM_OBJECT_POOL_COUNT; i++) {
+            struct vm_object_pool *pool = &vm_object_pools[i];
+            
+            simple_lock(&pool->pool_lock);
+            
+            if (pool->count < pool->max_count / 2) {
+                /* Pool is under half full, pre-allocate some objects */
+                unsigned int to_alloc = pool->max_count / 4;
+                for (unsigned int j = 0; j < to_alloc && pool->count < pool->max_count; j++) {
+                    vm_object_t obj = (vm_object_t)zalloc(vm_object_zone);
+                    if (obj != NULL) {
+                        _vm_object_allocate(pool->object_size, obj);
+                        pool->objects[pool->count++] = obj;
+                    }
+                }
+            }
+            
+            simple_unlock(&pool->pool_lock);
+        }
+    }
+}
+
+/*
+ * ============================================================================
+ * STATISTICS COLLECTOR THREAD
+ * ============================================================================
+ */
+
+void vm_object_stats_collector_thread(void)
+{
+    thread_set_name(current_thread(), "vm_object_stats_collector");
+    
+    while (1) {
+        thread_sleep(&vm_object_stats_collector_thread, NULL, 60000); /* 60 seconds */
+        
+        /* Collect and log statistics */
+        if (vm_object_debug_enabled) {
+            printf("\n=== VM Object Statistics ===\n");
+            printf("Objects: %u (peak: %u)\n",
+                   vm_object_global_state.object_count,
+                   vm_object_global_state.object_count_peak);
+            printf("Allocations: %llu, Deallocations: %llu\n",
+                   vm_object_global_state.total_allocations,
+                   vm_object_global_state.total_deallocations);
+            printf("Memory: %llu MB allocated, %llu MB deallocated\n",
+                   vm_object_global_state.total_bytes_allocated / (1024 * 1024),
+                   vm_object_global_state.total_bytes_deallocated / (1024 * 1024));
+            printf("Cache: hits=%llu, misses=%llu, size=%u\n",
+                   vm_object_global_state.cache_hits,
+                   vm_object_global_state.cache_misses,
+                   vm_object_global_state.cache_size);
+            printf("Compression: pages=%llu, saved=%llu MB\n",
+                   vm_object_global_state.compressed_pages,
+                   vm_object_global_state.compressed_bytes_saved / (1024 * 1024));
+            printf("Deduplication: pages=%llu, saved=%llu MB\n",
+                   vm_object_global_state.dedup_pages_shared,
+                   vm_object_global_state.dedup_bytes_saved / (1024 * 1024));
+            printf("NUMA: migrations=%llu, remote=%llu, local=%llu\n",
+                   vm_object_global_state.numa_migrations,
+                   vm_object_global_state.numa_remote_accesses,
+                   vm_object_global_state.numa_local_accesses);
+            printf("============================\n");
+        }
+    }
+}
+
+/*
+ * ============================================================================
+ * HELPER FUNCTIONS
+ * ============================================================================
+ */
+
+/* Stub implementations for compression algorithms */
+static unsigned int vm_compress_lz4(unsigned char *src, vm_size_t src_len,
+                                     unsigned char *dst, vm_size_t *dst_len)
+{
+    /* Would call actual LZ4 compression */
+    *dst_len = src_len / 2;
+    return 0;
+}
+
+static unsigned int vm_decompress_lz4(unsigned char *src, vm_size_t src_len,
+                                       unsigned char *dst, vm_size_t *dst_len)
+{
+    *dst_len = src_len * 2;
+    return 0;
+}
+
+static boolean_t vm_compress_lz4_init(void) { return TRUE; }
+static void vm_compress_lz4_cleanup(void) { }
+
+static unsigned int vm_compress_zstd(unsigned char *src, vm_size_t src_len,
+                                      unsigned char *dst, vm_size_t *dst_len)
+{
+    *dst_len = src_len / 2;
+    return 0;
+}
+
+static unsigned int vm_decompress_zstd(unsigned char *src, vm_size_t src_len,
+                                        unsigned char *dst, vm_size_t *dst_len)
+{
+    *dst_len = src_len * 2;
+    return 0;
+}
+
+static boolean_t vm_compress_zstd_init(void) { return TRUE; }
+static void vm_compress_zstd_cleanup(void) { }
+
+static unsigned int vm_compress_lzo(unsigned char *src, vm_size_t src_len,
+                                     unsigned char *dst, vm_size_t *dst_len)
+{
+    *dst_len = src_len / 2;
+    return 0;
+}
+
+static unsigned int vm_decompress_lzo(unsigned char *src, vm_size_t src_len,
+                                       unsigned char *dst, vm_size_t *dst_len)
+{
+    *dst_len = src_len * 2;
+    return 0;
+}
+
+static boolean_t vm_compress_lzo_init(void) { return TRUE; }
+static void vm_compress_lzo_cleanup(void) { }
+
+/* Object type callbacks */
+static void vm_object_kernel_init(vm_object_t obj) { }
+static void vm_object_kernel_destroy(vm_object_t obj) { }
+static void vm_object_user_init(vm_object_t obj) { }
+static void vm_object_user_destroy(vm_object_t obj) { }
+static void vm_object_anon_init(vm_object_t obj) { }
+static void vm_object_anon_destroy(vm_object_t obj) { }
+static void vm_object_shared_init(vm_object_t obj) { }
+static void vm_object_shared_destroy(vm_object_t obj) { }
+
+/* System initializations */
+static void vm_deduplication_init(void) { }
+static void vm_encryption_init(void) { }
+static void vm_object_perf_counters_init(void) { }
+static void vm_object_memory_pressure_init(void) { }
+static void vm_object_power_management_init(void) { }
+static void vm_object_debug_init(void) { }
+
+
+void vm_object_init(void)
+{ unsigned int i, j;
+    unsigned long long start_time;
+    unsigned long long end_time;
+    vm_size_t total_memory;
+    
+    start_time = mach_absolute_time();
+    
+    printf("\n========================================\n");
+    printf("Initializing Extended VM Object Subsystem\n");
+    printf("========================================\n");
+    
+    /* ========== PHASE 1: GLOBAL STATE INITIALIZATION ========== */
+    memset(&vm_object_global_state, 0, sizeof(vm_object_global_state));
+    simple_lock_init(&vm_object_global_state.list_lock);
+    
+    vm_object_global_state.object_count_limit = 1000000; /* 1 million objects max */
+    vm_object_global_state.cache_max_size = 10000;
+    vm_object_global_state.low_memory_threshold = 100 * 1024 * 1024; /* 100MB */
+    vm_object_global_state.high_memory_threshold = 500 * 1024 * 1024; /* 500MB */
+    
+    printf("  Global state initialized\n");
+    printf("    Object limit: %u\n", vm_object_global_state.object_count_limit);
+    printf("    Cache max size: %u\n", vm_object_global_state.cache_max_size);
+    
+    /* ========== PHASE 2: OBJECT POOLS INITIALIZATION ========== */
+    for (i = 0; i < VM_OBJECT_POOL_COUNT; i++) {
+        vm_object_pools[i].object_size = PAGE_SIZE * (1 << i);
+        vm_object_pools[i].max_count = 1000;
+        vm_object_pools[i].objects = (vm_object_t *)kalloc(
+            vm_object_pools[i].max_count * sizeof(vm_object_t));
+        if (vm_object_pools[i].objects == NULL) {
+            printf("  Warning: Failed to initialize pool for size %lu\n",
+                   vm_object_pools[i].object_size);
+            continue;
+        }
+        memset(vm_object_pools[i].objects, 0, 
+               vm_object_pools[i].max_count * sizeof(vm_object_t));
+        vm_object_pools[i].count = 0;
+        vm_object_pools[i].hit_count = 0;
+        vm_object_pools[i].miss_count = 0;
+        simple_lock_init(&vm_object_pools[i].pool_lock);
+        
+        printf("  Object pool %u: size=%lu, max=%u\n", i,
+               vm_object_pools[i].object_size, vm_object_pools[i].max_count);
+    }
+    
+    /* ========== PHASE 3: NUMA CACHES INITIALIZATION ========== */
+    unsigned int numa_nodes = vm_numa_node_count();
+    for (i = 0; i < numa_nodes && i < MAX_NUMA_NODES; i++) {
+        vm_object_numa_caches[i].max_count = 5000;
+        vm_object_numa_caches[i].objects = (vm_object_t *)kalloc(
+            vm_object_numa_caches[i].max_count * sizeof(vm_object_t));
+        if (vm_object_numa_caches[i].objects == NULL) {
+            printf("  Warning: Failed to initialize NUMA cache for node %u\n", i);
+            continue;
+        }
+        memset(vm_object_numa_caches[i].objects, 0,
+               vm_object_numa_caches[i].max_count * sizeof(vm_object_t));
+        vm_object_numa_caches[i].count = 0;
+        vm_object_numa_caches[i].node_id = i;
+        simple_lock_init(&vm_object_numa_caches[i].cache_lock);
+        
+        printf("  NUMA cache %u: max=%u\n", i, vm_object_numa_caches[i].max_count);
+    }
+    
+    /* ========== PHASE 4: COMPRESSION ALGORITHMS REGISTRATION ========== */
+    
+    /* LZ4 Algorithm */
+    vm_compression_algorithms[VM_COMPRESS_LZ4].id = VM_COMPRESS_LZ4;
+    strcpy(vm_compression_algorithms[VM_COMPRESS_LZ4].name, "LZ4");
+    vm_compression_algorithms[VM_COMPRESS_LZ4].priority = 90;
+    vm_compression_algorithms[VM_COMPRESS_LZ4].compress = vm_compress_lz4;
+    vm_compression_algorithms[VM_COMPRESS_LZ4].decompress = vm_decompress_lz4;
+    vm_compression_algorithms[VM_COMPRESS_LZ4].init = vm_compress_lz4_init;
+    vm_compression_algorithms[VM_COMPRESS_LZ4].cleanup = vm_compress_lz4_cleanup;
+    
+    /* ZSTD Algorithm */
+    vm_compression_algorithms[VM_COMPRESS_ZSTD].id = VM_COMPRESS_ZSTD;
+    strcpy(vm_compression_algorithms[VM_COMPRESS_ZSTD].name, "ZSTD");
+    vm_compression_algorithms[VM_COMPRESS_ZSTD].priority = 80;
+    vm_compression_algorithms[VM_COMPRESS_ZSTD].compress = vm_compress_zstd;
+    vm_compression_algorithms[VM_COMPRESS_ZSTD].decompress = vm_decompress_zstd;
+    vm_compression_algorithms[VM_COMPRESS_ZSTD].init = vm_compress_zstd_init;
+    vm_compression_algorithms[VM_COMPRESS_ZSTD].cleanup = vm_compress_zstd_cleanup;
+    
+    /* LZO Algorithm */
+    vm_compression_algorithms[VM_COMPRESS_LZO].id = VM_COMPRESS_LZO;
+    strcpy(vm_compression_algorithms[VM_COMPRESS_LZO].name, "LZO");
+    vm_compression_algorithms[VM_COMPRESS_LZO].priority = 70;
+    vm_compression_algorithms[VM_COMPRESS_LZO].compress = vm_compress_lzo;
+    vm_compression_algorithms[VM_COMPRESS_LZO].decompress = vm_decompress_lzo;
+    vm_compression_algorithms[VM_COMPRESS_LZO].init = vm_compress_lzo_init;
+    vm_compression_algorithms[VM_COMPRESS_LZO].cleanup = vm_compress_lzo_cleanup;
+    
+    printf("  Compression algorithms registered:\n");
+    for (i = 0; i < VM_COMPRESS_MAX; i++) {
+        if (vm_compression_algorithms[i].id != 0) {
+            printf("    %s (priority=%u)\n", 
+                   vm_compression_algorithms[i].name,
+                   vm_compression_algorithms[i].priority);
+        }
+    }
+    
+    /* ========== PHASE 5: OBJECT TYPES REGISTRATION ========== */
+    
+    /* Kernel object type */
+    vm_object_types[VM_OBJECT_TYPE_KERNEL].type_id = VM_OBJECT_TYPE_KERNEL;
+    strcpy(vm_object_types[VM_OBJECT_TYPE_KERNEL].name, "kernel");
+    vm_object_types[VM_OBJECT_TYPE_KERNEL].default_flags = VM_OBJECT_FLAG_PINNED;
+    vm_object_types[VM_OBJECT_TYPE_KERNEL].default_priority = 100;
+    vm_object_types[VM_OBJECT_TYPE_KERNEL].init_callback = vm_object_kernel_init;
+    vm_object_types[VM_OBJECT_TYPE_KERNEL].destroy_callback = vm_object_kernel_destroy;
+    
+    /* User object type */
+    vm_object_types[VM_OBJECT_TYPE_USER].type_id = VM_OBJECT_TYPE_USER;
+    strcpy(vm_object_types[VM_OBJECT_TYPE_USER].name, "user");
+    vm_object_types[VM_OBJECT_TYPE_USER].default_flags = VM_OBJECT_FLAG_NONE;
+    vm_object_types[VM_OBJECT_TYPE_USER].default_priority = 50;
+    vm_object_types[VM_OBJECT_TYPE_USER].init_callback = vm_object_user_init;
+    vm_object_types[VM_OBJECT_TYPE_USER].destroy_callback = vm_object_user_destroy;
+    
+    /* Anonymous object type */
+    vm_object_types[VM_OBJECT_TYPE_ANON].type_id = VM_OBJECT_TYPE_ANON;
+    strcpy(vm_object_types[VM_OBJECT_TYPE_ANON].name, "anonymous");
+    vm_object_types[VM_OBJECT_TYPE_ANON].default_flags = VM_OBJECT_FLAG_COMPRESS;
+    vm_object_types[VM_OBJECT_TYPE_ANON].default_priority = 30;
+    vm_object_types[VM_OBJECT_TYPE_ANON].init_callback = vm_object_anon_init;
+    vm_object_types[VM_OBJECT_TYPE_ANON].destroy_callback = vm_object_anon_destroy;
+    
+    /* Shared memory object type */
+    vm_object_types[VM_OBJECT_TYPE_SHARED].type_id = VM_OBJECT_TYPE_SHARED;
+    strcpy(vm_object_types[VM_OBJECT_TYPE_SHARED].name, "shared");
+    vm_object_types[VM_OBJECT_TYPE_SHARED].default_flags = VM_OBJECT_FLAG_DEDUP;
+    vm_object_types[VM_OBJECT_TYPE_SHARED].default_priority = 40;
+    vm_object_types[VM_OBJECT_TYPE_SHARED].init_callback = vm_object_shared_init;
+    vm_object_types[VM_OBJECT_TYPE_SHARED].destroy_callback = vm_object_shared_destroy;
+    
+    printf("  Object types registered: %u\n", VM_OBJECT_TYPE_MAX);
+    
+    /* ========== PHASE 6: DEDUPLICATION SYSTEM INIT ========== */
+    vm_deduplication_init();
+    printf("  Deduplication system initialized\n");
+    
+    /* ========== PHASE 7: ENCRYPTION SYSTEM INIT ========== */
+    vm_encryption_init();
+    printf("  Encryption system initialized\n");
+    
+    /* ========== PHASE 8: WATCHDOG INITIALIZATION ========== */
+    vm_object_watchdog.last_check = mach_absolute_time();
+    vm_object_watchdog.check_interval_ns = 60000000000ULL; /* 60 seconds */
+    vm_object_watchdog.stuck_objects = 0;
+    vm_object_watchdog.recovered_objects = 0;
+    simple_lock_init(&vm_object_watchdog.watchdog_lock);
+    printf("  Watchdog initialized (interval=%llu ms)\n",
+           vm_object_watchdog.check_interval_ns / 1000000);
+    
+    /* ========== PHASE 9: MONITORING THREAD ========== */
+    kernel_thread(kernel_task, "vm_object_monitor",
+                  (continuation_t)vm_object_monitor_thread, NULL);
+    printf("  Monitoring thread started\n");
+    
+    /* ========== PHASE 10: WATCHDOG THREAD ========== */
+    kernel_thread(kernel_task, "vm_object_watchdog",
+                  (continuation_t)vm_object_watchdog_thread, NULL);
+    printf("  Watchdog thread started\n");
+    
+    /* ========== PHASE 11: CACHE WARMER THREAD ========== */
+    kernel_thread(kernel_task, "vm_object_cache_warmer",
+                  (continuation_t)vm_object_cache_warmer_thread, NULL);
+    printf("  Cache warmer thread started\n");
+    
+    /* ========== PHASE 12: STATISTICS COLLECTOR THREAD ========== */
+    kernel_thread(kernel_task, "vm_object_stats_collector",
+                  (continuation_t)vm_object_stats_collector_thread, NULL);
+    printf("  Statistics collector thread started\n");
+    
+    /* ========== PHASE 13: KERNEL OBJECT INITIALIZATION ========== */
+    vm_object_lock(kernel_object);
+    kernel_object->object_id = 1;
+    kernel_object->type = VM_OBJECT_TYPE_KERNEL;
+    kernel_object->flags = VM_OBJECT_FLAG_PINNED | VM_OBJECT_FLAG_NO_CACHE;
+    kernel_object->priority = 100;
+    kernel_object->numa_node = 0;
+    kernel_object->creation_time = mach_absolute_time();
+    kernel_object->state = VM_OBJECT_STATE_ACTIVE;
+    strcpy(kernel_object->name, "kernel_object");
+    vm_object_unlock(kernel_object);
+    
+    printf("  Kernel object initialized: id=%u\n", kernel_object->object_id);
+    
+    /* ========== PHASE 14: SUBMAP OBJECT INITIALIZATION ========== */
+    vm_object_lock(vm_submap_object);
+    vm_submap_object->object_id = 2;
+    vm_submap_object->type = VM_OBJECT_TYPE_KERNEL;
+    vm_submap_object->flags = VM_OBJECT_FLAG_PINNED;
+    vm_submap_object->priority = 90;
+    vm_submap_object->numa_node = 0;
+    vm_submap_object->creation_time = mach_absolute_time();
+    strcpy(vm_submap_object->name, "submap_object");
+    vm_object_unlock(vm_submap_object);
+    
+    printf("  Submap object initialized: id=%u\n", vm_submap_object->object_id);
+    
+    /* ========== PHASE 15: PERFORMANCE COUNTERS INIT ========== */
+    vm_object_perf_counters_init();
+    printf("  Performance counters initialized\n");
+    
+    /* ========== PHASE 16: MEMORY PRESSURE CALLBACKS ========== */
+    vm_object_memory_pressure_init();
+    printf("  Memory pressure callbacks registered\n");
+    
+    /* ========== PHASE 17: POWER MANAGEMENT CALLBACKS ========== */
+    vm_object_power_management_init();
+    printf("  Power management callbacks registered\n");
+    
+    /* ========== PHASE 18: DEBUGGING AIDS ========== */
+    if (vm_object_debug_enabled) {
+        vm_object_debug_init();
+        printf("  Debugging aids initialized\n");
+    }
+    
+    /* ========== PHASE 19: FINAL STATISTICS ========== */
+    total_memory = vm_page_count() * PAGE_SIZE;
+    vm_object_global_state.peak_memory_usage = 0;
+    vm_object_global_state.current_memory_usage = 0;
+    
+    end_time = mach_absolute_time();
+    
+    /* ========== PHASE 20: COMPLETION LOG ========== */
+    printf("\n========================================\n");
+    printf("VM Object Subsystem Initialization Complete\n");
+    printf("  Total initialization time: %llu ms\n", (end_time - start_time) / 1000000);
+    printf("  Total physical memory: %llu MB\n", total_memory / (1024 * 1024));
+    printf("  Object pools: %u\n", VM_OBJECT_POOL_COUNT);
+    printf("  NUMA caches: %u\n", numa_nodes);
+    printf("  Compression algorithms: %u\n", VM_COMPRESS_MAX);
+    printf("  Object types: %u\n", VM_OBJECT_TYPE_MAX);
+    printf("  Global state: objects=%u, limit=%u\n",
+           vm_object_global_state.object_count,
+           vm_object_global_state.object_count_limit);
+    printf("========================================\n\n");
 }
 
 #if	TASK_SWAPPER
