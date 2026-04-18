@@ -1251,6 +1251,217 @@ vm_object_deallocate_lazy(
 #endif	/* NORMA_VM */
 
 /*
+ * ============================================================================
+ * CLEANUP HELPER FUNCTIONS
+ * ============================================================================
+ */
+
+/*
+ * vm_object_compression_cleanup - Clean up compressed data
+ */
+void vm_object_compression_cleanup(vm_object_t object)
+{
+    if (object == NULL) return;
+    
+    if (object->compressed_data != NULL) {
+        struct vm_object_compressed_data *comp_data = 
+            (struct vm_object_compressed_data *)object->compressed_data;
+        
+        if (comp_data->compressed_pages != NULL) {
+            kfree((vm_offset_t)comp_data->compressed_pages, 
+                  comp_data->num_pages * PAGE_SIZE);
+        }
+        if (comp_data->page_offsets != NULL) {
+            kfree((vm_offset_t)comp_data->page_offsets, 
+                  comp_data->num_pages * sizeof(unsigned long long));
+        }
+        if (comp_data->page_sizes != NULL) {
+            kfree((vm_offset_t)comp_data->page_sizes, 
+                  comp_data->num_pages * sizeof(unsigned int));
+        }
+        kfree((vm_offset_t)comp_data, sizeof(struct vm_object_compressed_data));
+        object->compressed_data = NULL;
+    }
+    
+    object->compressed = FALSE;
+    object->compressed_size = 0;
+}
+
+/*
+ * vm_object_deduplication_cleanup - Clean up deduplication data
+ */
+void vm_object_deduplication_cleanup(vm_object_t object)
+{
+    if (object == NULL) return;
+    
+    if (object->dedup_shared_with != NULL) {
+        /* Remove reference from shared object */
+        vm_object_lock(object->dedup_shared_with);
+        object->dedup_shared_with->dedup_refcount--;
+        vm_object_unlock(object->dedup_shared_with);
+        object->dedup_shared_with = NULL;
+    }
+    
+    object->dedup_enabled = FALSE;
+    object->dedup_shared = FALSE;
+    object->dedup_refcount = 0;
+}
+
+/*
+ * vm_object_encryption_cleanup - Clean up encryption data
+ */
+void vm_object_encryption_cleanup(vm_object_t object)
+{
+    if (object == NULL) return;
+    
+    if (object->encryption_key != NULL) {
+        /* Securely zero encryption key */
+        memset(object->encryption_key, 0, 32);
+        kfree((vm_offset_t)object->encryption_key, 32);
+        object->encryption_key = NULL;
+    }
+    
+    object->encrypted = FALSE;
+    object->encryption_enabled = FALSE;
+}
+
+/*
+ * vm_object_numa_cleanup - Clean up NUMA tracking data
+ */
+void vm_object_numa_cleanup(vm_object_t object)
+{
+    if (object == NULL) return;
+    
+    /* Log NUMA statistics before cleanup */
+    if (vm_object_debug_enabled && object->numa_migrations > 0) {
+        printf("NUMA stats for obj %u: migrations=%u, remote_access=%llu\n",
+               object->object_id, object->numa_migrations, 
+               object->numa_remote_accesses);
+    }
+    
+    object->numa_migrations = 0;
+    object->numa_remote_accesses = 0;
+    object->numa_local_accesses = 0;
+}
+
+/*
+ * vm_object_working_set_cleanup - Clean up working set tracking
+ */
+void vm_object_working_set_cleanup(vm_object_t object)
+{
+    if (object == NULL) return;
+    
+    object->working_set_enabled = FALSE;
+    object->working_set_index = 0;
+    memset(object->working_set_pages, 0, sizeof(object->working_set_pages));
+}
+
+/*
+ * vm_object_perf_cleanup - Clean up performance counters
+ */
+void vm_object_perf_cleanup(vm_object_t object)
+{
+    if (object == NULL) return;
+    
+    object->perf_counters_enabled = FALSE;
+    object->perf_read_ops = 0;
+    object->perf_write_ops = 0;
+    object->perf_read_bandwidth = 0;
+    object->perf_write_bandwidth = 0;
+}
+
+/*
+ * vm_object_audit_cleanup - Clean up audit log
+ */
+void vm_object_audit_cleanup(vm_object_t object)
+{
+    if (object == NULL || object->audit_log == NULL) return;
+    
+    kfree((vm_offset_t)object->audit_log, 4096);
+    object->audit_log = NULL;
+    object->audit_enabled = FALSE;
+}
+
+/*
+ * vm_object_monitor_deregister - Deregister from monitoring
+ */
+void vm_object_monitor_deregister(vm_object_t object)
+{
+    static struct vm_object_monitor *monitors[1024];
+    static unsigned int monitor_count = 0;
+    static simple_lock_t monitor_lock;
+    unsigned int i;
+    
+    simple_lock(&monitor_lock);
+    for (i = 0; i < monitor_count; i++) {
+        if (monitors[i] == object) {
+            for (unsigned int j = i; j < monitor_count - 1; j++) {
+                monitors[j] = monitors[j + 1];
+            }
+            monitor_count--;
+            break;
+        }
+    }
+    simple_unlock(&monitor_lock);
+    
+    object->monitor_registered = FALSE;
+}
+
+/*
+ * vm_object_terminate_extended - Extended termination
+ */
+void vm_object_terminate_extended(vm_object_t object, unsigned int flags)
+{
+    if (object == NULL) return;
+    
+    /* Call original termination */
+    vm_object_terminate(object);
+    
+    /* Extended cleanup */
+    if (flags & VM_OBJECT_TERMINATE_FORCE) {
+        /* Force immediate cleanup of all resources */
+        if (object->pager != IP_NULL) {
+            ipc_port_release_send(object->pager);
+            object->pager = IP_NULL;
+        }
+    }
+}
+
+/*
+ * vm_object_update_working_set - Update working set tracking
+ */
+void vm_object_update_working_set(vm_object_t object)
+{
+    if (object == NULL || !object->working_set_enabled) return;
+    
+    unsigned int current_pages = object->resident_page_count;
+    unsigned int idx = object->working_set_index % 8;
+    
+    object->working_set_pages[idx] = current_pages;
+    object->working_set_timestamps[idx] = mach_absolute_time();
+    object->working_set_index++;
+}
+
+/*
+ * vm_object_update_hotness - Update object hotness score
+ */
+void vm_object_update_hotness(vm_object_t object)
+{
+    if (object == NULL) return;
+    
+    unsigned long long now = mach_absolute_time();
+    unsigned long long age = now - object->hotness_last_update;
+    float decay = expf(-(float)age / 1000000000.0f); /* Decay over 1 second */
+    
+    /* Calculate hotness based on access frequency and recency */
+    float new_hotness = (object->access_count * 100.0f) / (object->ref_count + 1);
+    new_hotness = new_hotness * decay + object->hotness_score * (1 - decay);
+    
+    object->hotness_score = (unsigned int)new_hotness;
+    object->hotness_last_update = now;
+}
+	
+/*
  *	vm_object_deallocate:
  *
  *	Release a reference to the specified object,
@@ -1261,250 +1472,300 @@ vm_object_deallocate_lazy(
  *
  *	No object may be locked.
  */
-void
-vm_object_deallocate(
-	register vm_object_t	object)
+
+void vm_object_deallocate(
+    register vm_object_t object,
+    unsigned int flags)
 {
-	boolean_t retry_cache_trim = FALSE;
-	vm_object_t shadow;
-
-	while (object != VM_OBJECT_NULL) {
-
-		/*
-		 *	The cache holds a reference (uncounted) to
-		 *	the object; we must lock it before removing
-		 *	the object.
-		 */
-
-		vm_object_cache_lock();
-		vm_object_lock(object);
-		assert(object->alive);
-
-		/*
-		 *	Lose the reference. If other references
-		 *	remain, then we are done, unless we need
-		 *	to retry a cache trim.
-		 *	If it is the last reference, then keep it
-		 *	until any pending initialization is completed.
-		 */
-
-		assert(object->ref_count > 0);
-		if (object->ref_count > 1) {
-			object->ref_count--;
-			vm_object_res_deallocate(object);
-			vm_object_unlock(object);
-			vm_object_cache_unlock();
-			if (retry_cache_trim &&
-			    ((object = vm_object_cache_trim(TRUE)) !=
-			     VM_OBJECT_NULL)) {
-				continue;
-			}
-			return;
-		}
-
-		/*
-		 *	We have to wait for initialization
-		 *	before destroying or caching the object.
-		 */
-		
-		if (object->pager_created && ! object->pager_initialized) {
-			assert(! object->can_persist);
-			vm_object_assert_wait(object,
-					      VM_OBJECT_EVENT_INITIALIZED,
-					      FALSE);
-			vm_object_unlock(object);
-			vm_object_cache_unlock();
-			thread_block((void (*)(void))0);
-			continue;
-		}
-
-#if	NORMA_VM
-		/*
-		 * We have to synchronize m_o_caching() with
-		 * m_o_set_attributes()/m_o_destroy() and vm_object_uncache().
-		 */
-		if (object->temporary_caching) {
-			vm_object_assert_wait(object,
-					      VM_OBJECT_EVENT_CACHING,
-					      FALSE);
-			vm_object_unlock(object);
-			vm_object_cache_unlock();
-			thread_block((void (*)(void)) 0);
-			continue;
-		}
-#endif	/* NORMA_VM */
-
-		/*
-		 *	If this object can persist, then enter it in
-		 *	the cache. Otherwise, terminate it.
-		 *
-		 * 	NOTE:  Only permanent objects are cached, and
-		 *	permanent objects cannot have shadows.  This
-		 *	affects the residence counting logic in a minor
-		 *	way (can do it in-line, mostly).
-		 */
-
-		if (object->can_persist
-#if	NORMA_VM
-		    &&
-		    (!object->temporary || object->resident_page_count > 0)
-#endif	/* NORMA_VM */
-		    ) {
-#if	NORMA_VM
-			/*
-			 *	If we are about to cache a temporary object,
-			 *	we must tell the memory manager, so that it
-			 *	can coordinate a termination when appropriate.
-			 *
-			 *	We might, however, simply be returning
-			 *	an object to the cache without having
-			 *	asked to remove it, if we were pulled
-			 *	out of the cache by vm_object_lookup
-			 *	on behalf of a memory manager operation.
-			 */
-			if (object->temporary && ! object->temporary_cached) {
-				assert(!object->temporary_caching);
-				object->temporary_caching = TRUE;
-				vm_object_unlock(object);
-				vm_object_cache_unlock();
-				memory_object_caching(object->pager,
-						      object->pager_request);
-				vm_object_cache_lock();
-				vm_object_lock(object);
-				object->temporary_cached = TRUE;
-				object->temporary_caching = FALSE;
-				vm_object_wakeup(object,
-						 VM_OBJECT_EVENT_CACHING);
-			}
-#endif	/* NORMA_VM */
-			/*
-			 *	Now it is safe to decrement reference count,
-			 *	and to return if reference count is > 0.
-			 */
-			if (--object->ref_count > 0) {
-				vm_object_res_deallocate(object);
-				vm_object_unlock(object);
-				vm_object_cache_unlock();
-				if (retry_cache_trim &&
-				    ((object = vm_object_cache_trim(TRUE)) !=
-				     VM_OBJECT_NULL)) {
-					continue;
-				}
-				return;
-			}
-
-#if	MIGHT_NOT_CACHE_SHADOWS
-			/*
-			 *	Remove shadow now if we don't
-			 *	want to cache shadows.
-			 */
-			if (! cache_shadows) {
-				shadow = object->shadow;
-				object->shadow = VM_OBJECT_NULL;
-			}
-#endif	/* MIGHT_NOT_CACHE_SHADOWS */
-
-			/*
-			 *	Enter the object onto the queue of
-			 *	cached objects, and deactivate
-			 *	all of its pages.
-			 */
-			assert(object->shadow == VM_OBJECT_NULL);
-			VM_OBJ_RES_DECR(object);
-			XPR(XPR_VM_OBJECT,
-		      "vm_o_deallocate: adding %x to cache, queue = (%x, %x)\n",
-				(integer_t)object,
-				(integer_t)vm_object_cached_list.next,
-				(integer_t)vm_object_cached_list.prev,0,0);
-
-			vm_object_cached_count++;
-			if (vm_object_cached_count > vm_object_cached_high)
-				vm_object_cached_high = vm_object_cached_count;
-			queue_enter(&vm_object_cached_list, object,
-				vm_object_t, cached_list);
-			vm_object_cache_unlock();
-			vm_object_deactivate_pages(object);
-			vm_object_unlock(object);
-
-#if	MIGHT_NOT_CACHE_SHADOWS
-			/*
-			 *	If we have a shadow that we need
-			 *	to deallocate, do so now, remembering
-			 *	to trim the cache later.
-			 */
-			if (! cache_shadows && shadow != VM_OBJECT_NULL) {
-				object = shadow;
-				retry_cache_trim = TRUE;
-				continue;
-			}
-#endif	/* MIGHT_NOT_CACHE_SHADOWS */
-
-			/*
-			 *	Trim the cache. If the cache trim
-			 *	returns with a shadow for us to deallocate,
-			 *	then remember to retry the cache trim
-			 *	when we are done deallocating the shadow.
-			 *	Otherwise, we are done.
-			 */
-
-			object = vm_object_cache_trim(TRUE);
-			if (object == VM_OBJECT_NULL) {
-				return;
-			}
-			retry_cache_trim = TRUE;
-
-		} else {
-			/*
-			 *	This object is not cachable; terminate it.
-			 */
-			XPR(XPR_VM_OBJECT,
-	 "vm_o_deallocate: !cacheable 0x%X res %d paging_ops %d thread 0x%lX ref %d\n",
-				(integer_t)object, object->resident_page_count,
-				object->paging_in_progress,
-				(natural_t)current_thread(),object->ref_count);
-
-
-#if	NORMA_VM
-			/*
-			 *	Wake up anyone waiting for a reply to an
-			 *	uncache request. They will see that
-			 *	object->pager is now null, indicating
-			 *	that the object has destroyed and thus
-			 *	that they have lost.
-			 */
-			if (object->temporary_uncaching) {
-				assert(object->temporary_cached);
-				object->temporary_cached = FALSE;
-				object->temporary_uncaching = FALSE;
-				vm_object_wakeup(object,
-						 VM_OBJECT_EVENT_UNCACHING);
-			}
-#endif	/* NORMA_VM */
-			VM_OBJ_RES_DECR(object);	/* XXX ? */
-			/*
-			 *	Terminate this object. If it had a shadow,
-			 *	then deallocate it; otherwise, if we need
-			 *	to retry a cache trim, do so now; otherwise,
-			 *	we are done. "pageout" objects have a shadow,
-			 *	but maintain a "paging reference" rather than
-			 *	a normal reference.
-			 */
-			shadow = object->pageout?VM_OBJECT_NULL:object->shadow;
-			vm_object_terminate(object);
-			if (shadow != VM_OBJECT_NULL) {
-				object = shadow;
-				continue;
-			}
-			if (retry_cache_trim &&
-			    ((object = vm_object_cache_trim(TRUE)) !=
-			     VM_OBJECT_NULL)) {
-				continue;
-			}
-			return;
-		}
-	}
-	assert(! retry_cache_trim);
+    boolean_t retry_cache_trim = FALSE;
+    vm_object_t shadow;
+    unsigned long long start_time;
+    unsigned long long end_time;
+    unsigned int cleanup_phases = 0;
+    
+    start_time = mach_absolute_time();
+    
+    /* ========== PHASE 1: VALIDATION ========== */
+    if (object == VM_OBJECT_NULL) {
+        printf("vm_object_deallocate: NULL object\n");
+        return;
+    }
+    
+    /* ========== PHASE 2: LOGGING ========== */
+    if (vm_object_debug_enabled) {
+        printf("vm_object_deallocate: obj=%p id=%u ref=%d size=%lu\n",
+               object, object->object_id, object->ref_count, object->size);
+    }
+    
+    /* ========== PHASE 3: MAIN DEALLOCATION LOOP ========== */
+    while (object != VM_OBJECT_NULL) {
+        
+        /* ========== PHASE 4: CACHE LOCK AND OBJECT LOCK ========== */
+        vm_object_cache_lock();
+        vm_object_lock(object);
+        
+        if (!object->alive) {
+            /* Object already being terminated */
+            vm_object_unlock(object);
+            vm_object_cache_unlock();
+            return;
+        }
+        
+        /* ========== PHASE 5: REFERENCE COUNT DECREMENT ========== */
+        assert(object->ref_count > 0);
+        
+        if (object->ref_count > 1) {
+            /* Still have references - just decrement and return */
+            object->ref_count--;
+            
+            /* Update NUMA statistics if needed */
+            if (object->numa_migrations > 0) {
+                object->numa_last_access = mach_absolute_time();
+            }
+            
+            /* Update working set tracking */
+            if (object->working_set_enabled) {
+                vm_object_update_working_set(object);
+            }
+            
+            /* Update hotness score */
+            vm_object_update_hotness(object);
+            
+            vm_object_res_deallocate(object);
+            vm_object_unlock(object);
+            vm_object_cache_unlock();
+            
+            if (retry_cache_trim &&
+                ((object = vm_object_cache_trim(TRUE)) != VM_OBJECT_NULL)) {
+                continue;
+            }
+            return;
+        }
+        
+        /* ========== PHASE 6: WAIT FOR INITIALIZATION ========== */
+        if (object->pager_created && !object->pager_initialized) {
+            assert(!object->can_persist);
+            vm_object_assert_wait(object, VM_OBJECT_EVENT_INITIALIZED, FALSE);
+            vm_object_unlock(object);
+            vm_object_cache_unlock();
+            thread_block((void (*)(void))0);
+            continue;
+        }
+        
+#if NORMA_VM
+        /* ========== PHASE 7: SYNC WITH CACHING ========== */
+        if (object->temporary_caching) {
+            vm_object_assert_wait(object, VM_OBJECT_EVENT_CACHING, FALSE);
+            vm_object_unlock(object);
+            vm_object_cache_unlock();
+            thread_block((void (*)(void))0);
+            continue;
+        }
+#endif
+        
+        /* ========== PHASE 8: CHECK FOR PERSISTENCE ========== */
+        if (object->can_persist
+#if NORMA_VM
+            && (!object->temporary || object->resident_page_count > 0)
+#endif
+            ) {
+            
+            /* ========== PHASE 9: HANDLE TEMPORARY CACHING ========== */
+#if NORMA_VM
+            if (object->temporary && !object->temporary_cached) {
+                assert(!object->temporary_caching);
+                object->temporary_caching = TRUE;
+                vm_object_unlock(object);
+                vm_object_cache_unlock();
+                memory_object_caching(object->pager, object->pager_request);
+                vm_object_cache_lock();
+                vm_object_lock(object);
+                object->temporary_cached = TRUE;
+                object->temporary_caching = FALSE;
+                vm_object_wakeup(object, VM_OBJECT_EVENT_CACHING);
+            }
+#endif
+            
+            /* ========== PHASE 10: FINAL REFERENCE CHECK ========== */
+            if (--object->ref_count > 0) {
+                vm_object_res_deallocate(object);
+                vm_object_unlock(object);
+                vm_object_cache_unlock();
+                if (retry_cache_trim &&
+                    ((object = vm_object_cache_trim(TRUE)) != VM_OBJECT_NULL)) {
+                    continue;
+                }
+                return;
+            }
+            
+            /* ========== PHASE 11: REMOVE SHADOW IF NEEDED ========== */
+#if MIGHT_NOT_CACHE_SHADOWS
+            if (!cache_shadows) {
+                shadow = object->shadow;
+                object->shadow = VM_OBJECT_NULL;
+            }
+#endif
+            
+            /* ========== PHASE 12: ADD TO CACHE ========== */
+            assert(object->shadow == VM_OBJECT_NULL);
+            VM_OBJ_RES_DECR(object);
+            
+            vm_object_cached_count++;
+            if (vm_object_cached_count > vm_object_cached_high) {
+                vm_object_cached_high = vm_object_cached_count;
+            }
+            queue_enter(&vm_object_cached_list, object, vm_object_t, cached_list);
+            vm_object_cache_unlock();
+            
+            /* Deactivate pages */
+            vm_object_deactivate_pages(object);
+            vm_object_unlock(object);
+            
+            /* ========== PHASE 13: HANDLE SHADOW DEALLOCATION ========== */
+#if MIGHT_NOT_CACHE_SHADOWS
+            if (!cache_shadows && shadow != VM_OBJECT_NULL) {
+                object = shadow;
+                retry_cache_trim = TRUE;
+                continue;
+            }
+#endif
+            
+            /* ========== PHASE 14: TRIM CACHE ========== */
+            object = vm_object_cache_trim(TRUE);
+            if (object == VM_OBJECT_NULL) {
+                /* Update global statistics on successful caching */
+                simple_lock(&vm_object_global_stats_lock);
+                vm_object_global_stats.total_cached_objects++;
+                vm_object_global_stats.total_cached_bytes += object->size;
+                simple_unlock(&vm_object_global_stats_lock);
+                return;
+            }
+            retry_cache_trim = TRUE;
+            
+        } else {
+            /* ========== PHASE 15: OBJECT NOT CACHABLE - TERMINATE ========== */
+            
+            /* Clean up advanced features before termination */
+            cleanup_phases = 0;
+            
+            /* Phase 15a: Compression cleanup */
+            if (object->compressed && object->compressed_data != NULL) {
+                vm_object_compression_cleanup(object);
+                cleanup_phases++;
+            }
+            
+            /* Phase 15b: Deduplication cleanup */
+            if (object->dedup_enabled && object->dedup_shared) {
+                vm_object_deduplication_cleanup(object);
+                cleanup_phases++;
+            }
+            
+            /* Phase 15c: Encryption cleanup */
+            if (object->encrypted && object->encryption_key != NULL) {
+                vm_object_encryption_cleanup(object);
+                cleanup_phases++;
+            }
+            
+            /* Phase 15d: NUMA cleanup */
+            if (object->numa_migrations > 0) {
+                vm_object_numa_cleanup(object);
+                cleanup_phases++;
+            }
+            
+            /* Phase 15e: Working set cleanup */
+            if (object->working_set_enabled) {
+                vm_object_working_set_cleanup(object);
+                cleanup_phases++;
+            }
+            
+            /* Phase 15f: Performance counter cleanup */
+            if (object->perf_counters_enabled) {
+                vm_object_perf_cleanup(object);
+                cleanup_phases++;
+            }
+            
+            /* Phase 15g: Audit log cleanup */
+            if (object->audit_enabled && object->audit_log != NULL) {
+                vm_object_audit_cleanup(object);
+                cleanup_phases++;
+            }
+            
+            /* Phase 15h: Monitoring deregistration */
+            if (object->monitor_registered) {
+                vm_object_monitor_deregister(object);
+                cleanup_phases++;
+            }
+            
+            /* Phase 15i: Global list removal */
+            simple_lock(&vm_object_global_lock);
+            vm_object_t prev = NULL;
+            vm_object_t curr = vm_object_global_list;
+            while (curr != NULL) {
+                if (curr == object) {
+                    if (prev == NULL) {
+                        vm_object_global_list = object->global_next;
+                    } else {
+                        prev->global_next = object->global_next;
+                    }
+                    vm_object_count--;
+                    break;
+                }
+                prev = curr;
+                curr = curr->global_next;
+            }
+            simple_unlock(&vm_object_global_lock);
+            cleanup_phases++;
+            
+            /* Phase 15j: Wake up waiters */
+#if NORMA_VM
+            if (object->temporary_uncaching) {
+                assert(object->temporary_cached);
+                object->temporary_cached = FALSE;
+                object->temporary_uncaching = FALSE;
+                vm_object_wakeup(object, VM_OBJECT_EVENT_UNCACHING);
+            }
+#endif
+            VM_OBJ_RES_DECR(object);
+            
+            /* Phase 15k: Get shadow for continued deallocation */
+            shadow = object->pageout ? VM_OBJECT_NULL : object->shadow;
+            
+            /* Phase 15l: Terminate object */
+            vm_object_terminate_extended(object, flags);
+            
+            /* Update statistics */
+            simple_lock(&vm_object_global_stats_lock);
+            vm_object_global_stats.total_deallocations++;
+            vm_object_global_stats.total_deallocation_time_ns += 
+                mach_absolute_time() - start_time;
+            simple_unlock(&vm_object_global_stats_lock);
+            
+            /* Phase 15m: Continue with shadow if any */
+            if (shadow != VM_OBJECT_NULL) {
+                object = shadow;
+                continue;
+            }
+            
+            /* Phase 15n: Retry cache trim if needed */
+            if (retry_cache_trim &&
+                ((object = vm_object_cache_trim(TRUE)) != VM_OBJECT_NULL)) {
+                continue;
+            }
+            return;
+        }
+    }
+    
+    assert(!retry_cache_trim);
+    
+    end_time = mach_absolute_time();
+    
+    /* Log deallocation */
+    if (vm_object_debug_enabled) {
+        printf("vm_object_deallocate: completed in %llu ns, cleanup phases=%u\n",
+               end_time - start_time, cleanup_phases);
+    }
 }
+
 
 /*
  *	Check to see whether we really need to trim
