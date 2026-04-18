@@ -708,15 +708,282 @@ _vm_object_allocate(
 
 vm_object_t
 vm_object_allocate(
-	vm_size_t	size)
+   vm_size_t size,
+    unsigned int flags,
+    unsigned int numa_node,
+    unsigned int priority,
+    unsigned int *object_id_out)
 {
-	register vm_object_t object;
-	register ipc_port_t port;
-
-	object = (vm_object_t) zalloc(vm_object_zone);
-	_vm_object_allocate(size, object);
-
-	return object;
+    register vm_object_t object;
+    register ipc_port_t port;
+    unsigned long long start_time;
+    unsigned long long end_time;
+    unsigned int numa_node_actual;
+    static unsigned long long next_object_id = 1;
+    static simple_lock_t id_lock;
+    
+    start_time = mach_absolute_time();
+    
+    /* ========== PHASE 1: VALIDATION ========== */
+    if (size == 0) {
+        printf("vm_object_allocate: invalid size 0\n");
+        return VM_OBJECT_NULL;
+    }
+    
+    /* Align size to page boundary */
+    size = round_page(size);
+    
+    /* ========== PHASE 2: NUMA NODE SELECTION ========== */
+    if (numa_node == VM_OBJECT_NUMA_AUTO) {
+        /* Auto-select best NUMA node based on current CPU */
+        numa_node_actual = cpu_to_node(cpu_number());
+    } else if (numa_node < vm_numa_node_count()) {
+        numa_node_actual = numa_node;
+    } else {
+        numa_node_actual = 0; /* Default to node 0 */
+    }
+    
+    /* ========== PHASE 3: ALLOCATE FROM CACHE IF POSSIBLE ========== */
+    if (flags & VM_OBJECT_FLAG_USE_CACHE) {
+        object = vm_object_allocate_from_cache(size, numa_node_actual);
+        if (object != VM_OBJECT_NULL) {
+            /* Cache hit - reuse existing object */
+            vm_object_cache_hits++;
+            goto object_initialized;
+        }
+    }
+    
+    /* ========== PHASE 4: PRIMARY ALLOCATION ========== */
+    object = (vm_object_t) zalloc(vm_object_zone);
+    if (object == VM_OBJECT_NULL) {
+        printf("vm_object_allocate: failed to allocate from zone\n");
+        return VM_OBJECT_NULL;
+    }
+    
+    /* ========== PHASE 5: ZERO-INITIALIZATION ========== */
+    memset(object, 0, sizeof(struct vm_object));
+    
+    /* ========== PHASE 6: BASIC INITIALIZATION ========== */
+    _vm_object_allocate(size, object);
+    
+    /* ========== PHASE 7: EXTENDED FIELD INITIALIZATION ========== */
+    
+    /* Identification */
+    simple_lock(&id_lock);
+    object->object_id = next_object_id++;
+    simple_unlock(&id_lock);
+    
+    object->creation_time = mach_absolute_time();
+    object->last_access_time = object->creation_time;
+    object->last_modify_time = object->creation_time;
+    
+    /* NUMA fields */
+    object->numa_node = numa_node_actual;
+    object->numa_preferred_node = numa_node_actual;
+    object->numa_local_accesses = 0;
+    object->numa_remote_accesses = 0;
+    object->numa_migrations = 0;
+    object->numa_last_migration = 0;
+    
+    /* Performance monitoring */
+    object->page_faults = 0;
+    object->page_faults_major = 0;
+    object->page_faults_minor = 0;
+    object->page_faults_cow = 0;
+    object->page_faults_zero = 0;
+    object->page_faults_io = 0;
+    
+    /* Access tracking */
+    object->access_count = 0;
+    object->read_count = 0;
+    object->write_count = 0;
+    object->exec_count = 0;
+    object->hotness_score = 0;
+    object->hotness_last_update = object->creation_time;
+    
+    /* Working set tracking */
+    for (int i = 0; i < 8; i++) {
+        object->working_set_pages[i] = 0;
+        object->working_set_timestamps[i] = 0;
+    }
+    object->working_set_index = 0;
+    
+    /* Cache optimization */
+    object->cache_color = (object->object_id * 31) % machine_cache_colors();
+    object->cache_line_alignment = machine_cache_line_size();
+    object->prefetch_distance = 8; /* Default 8 pages prefetch */
+    
+    /* Memory hierarchy */
+    object->memory_tier = VM_MEMORY_TIER_DRAM;
+    object->promotion_count = 0;
+    object->demotion_count = 0;
+    object->last_promotion_time = 0;
+    
+    /* Compression */
+    object->compressed = FALSE;
+    object->compressed_size = 0;
+    object->compressed_data = NULL;
+    object->compression_algorithm = 0;
+    object->compression_ratio = 0;
+    
+    /* Deduplication */
+    object->dedup_hash = 0;
+    object->dedup_refcount = 0;
+    object->dedup_shared = FALSE;
+    object->dedup_shared_with = NULL;
+    
+    /* Encryption (if enabled) */
+    if (flags & VM_OBJECT_FLAG_ENCRYPT) {
+        object->encrypted = TRUE;
+        object->encryption_key = vm_crypto_generate_key();
+        object->encryption_algorithm = VM_CRYPTO_AES_256_GCM;
+    } else {
+        object->encrypted = FALSE;
+    }
+    
+    /* Resource limits */
+    object->max_size = size;
+    object->soft_limit = size;
+    object->hard_limit = size * 2;
+    object->growth_factor = 1.0f;
+    
+    /* Lock tracking */
+    object->lock_count = 0;
+    object->lock_holder = NULL;
+    object->lock_depth = 0;
+    object->lock_waiters = 0;
+    
+    /* Aging */
+    object->age_seconds = 0;
+    object->last_age_update = object->creation_time;
+    object->decay_factor = 0.95f;
+    
+    /* Pager optimization */
+    object->pager_cluster_size = PAGE_SIZE * 8;
+    object->pager_read_ahead = 16;
+    object->pager_write_behind = 8;
+    object->pager_async = TRUE;
+    
+    /* Memory pressure */
+    object->pressure_level = 0;
+    object->pressure_history = 0;
+    object->throttle_count = 0;
+    
+    /* QoS (Quality of Service) */
+    object->qos_class = VM_QOS_DEFAULT;
+    object->qos_priority = 0;
+    object->latency_sensitivity = 0;
+    object->throughput_requirement = 0;
+    
+    /* ========== PHASE 8: NUMA-AWARE PAGE ALLOCATION ========== */
+    if (flags & VM_OBJECT_FLAG_PREALLOCATE) {
+        unsigned int prealloc_pages = size / PAGE_SIZE;
+        if (prealloc_pages > 0 && prealloc_pages <= 1024) {
+            for (unsigned int i = 0; i < prealloc_pages; i++) {
+                vm_page_t page = vm_page_alloc_node(object, i * PAGE_SIZE, numa_node_actual);
+                if (page == VM_PAGE_NULL) {
+                    printf("vm_object_allocate: preallocation failed at page %u\n", i);
+                    break;
+                }
+                page->zero_filled = TRUE;
+                object->preallocated_pages++;
+            }
+        }
+    }
+    
+    /* ========== PHASE 9: COMPRESSION SETUP ========== */
+    if (flags & VM_OBJECT_FLAG_COMPRESS) {
+        object->compression_enabled = TRUE;
+        object->compression_threshold = 50; /* Compress if >50% zero pages */
+        object->compression_algorithm = VM_COMPRESS_LZ4;
+    }
+    
+    /* ========== PHASE 10: DEDUPLICATION SETUP ========== */
+    if (flags & VM_OBJECT_FLAG_DEDUP) {
+        object->dedup_enabled = TRUE;
+        object->dedup_scan_interval = 60; /* seconds */
+        object->dedup_last_scan = object->creation_time;
+    }
+    
+    /* ========== PHASE 11: ENCRYPTION SETUP ========== */
+    if (flags & VM_OBJECT_FLAG_ENCRYPT) {
+        object->encryption_enabled = TRUE;
+        object->encryption_iv_counter = 0;
+    }
+    
+    /* ========== PHASE 12: PERFORMANCE COUNTERS ========== */
+    object->perf_read_bandwidth = 0;
+    object->perf_write_bandwidth = 0;
+    object->perf_read_ops = 0;
+    object->perf_write_ops = 0;
+    object->perf_last_reset = object->creation_time;
+    
+    /* ========== PHASE 13: REGISTER WITH MONITORING ========== */
+    if (flags & VM_OBJECT_FLAG_MONITOR) {
+        vm_object_monitor_register(object);
+    }
+    
+    /* ========== PHASE 14: LOGGING AND AUDIT ========== */
+    if (flags & VM_OBJECT_FLAG_AUDIT) {
+        object->audit_enabled = TRUE;
+        object->audit_log = vm_audit_log_alloc();
+    }
+    
+    /* ========== PHASE 15: LINK TO GLOBAL TRACKING ========== */
+    simple_lock(&vm_object_global_lock);
+    object->global_next = vm_object_global_list;
+    vm_object_global_list = object;
+    vm_object_count++;
+    if (vm_object_count > vm_object_count_peak) {
+        vm_object_count_peak = vm_object_count;
+    }
+    simple_unlock(&vm_object_global_lock);
+    
+object_initialized:
+    
+    /* ========== PHASE 16: SET INITIAL STATE ========== */
+    object->state = VM_OBJECT_STATE_ACTIVE;
+    object->flags = flags;
+    object->priority = priority;
+    
+    /* ========== PHASE 17: CREATE PAGER IF NEEDED ========== */
+    if (flags & VM_OBJECT_FLAG_CREATE_PAGER) {
+        port = ipc_port_alloc_kernel();
+        if (port != IP_NULL) {
+            ipc_kobject_set(port, (ipc_kobject_t)object, IKOT_PAGER);
+            object->pager = port;
+            object->pager_created = TRUE;
+            object->pager_initialized = TRUE;
+        }
+    }
+    
+    /* ========== PHASE 18: UPDATE STATISTICS ========== */
+    end_time = mach_absolute_time();
+    object->allocation_time_ns = end_time - start_time;
+    
+    /* Update global statistics */
+    simple_lock(&vm_object_global_stats_lock);
+    vm_object_global_stats.total_allocations++;
+    vm_object_global_stats.total_bytes_allocated += size;
+    vm_object_global_stats.total_allocation_time_ns += object->allocation_time_ns;
+    if (object->allocation_time_ns > vm_object_global_stats.max_allocation_time_ns) {
+        vm_object_global_stats.max_allocation_time_ns = object->allocation_time_ns;
+    }
+    simple_unlock(&vm_object_global_stats_lock);
+    
+    /* ========== PHASE 19: RETURN OBJECT ID IF REQUESTED ========== */
+    if (object_id_out != NULL) {
+        *object_id_out = object->object_id;
+    }
+    
+    /* ========== PHASE 20: LOGGING ========== */
+    if (vm_object_debug_enabled) {
+        printf("vm_object_allocate: obj=%p id=%u size=%lu node=%u flags=0x%x time=%llu ns\n",
+               object, object->object_id, size, numa_node_actual, flags,
+               object->allocation_time_ns);
+    }
+    
+    return object;
 }
 
 /*
